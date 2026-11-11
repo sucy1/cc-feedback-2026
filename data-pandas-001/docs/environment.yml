@@ -1,0 +1,17 @@
+channels:
+  - conda-forge
+dependencies:
+  - python>=3
+  - pandoc
+  - ipykernel
+  - pip
+  - pip:
+    - myst_parser
+    - nbsphinx
+    - nbsphinx-link
+    - sphinx==7.1.2
+    - sphinx-autodoc-typehints
+    - sphinx_bootstrap_theme
+    - sphinx-copybutton
+    - IPython
+    - ..

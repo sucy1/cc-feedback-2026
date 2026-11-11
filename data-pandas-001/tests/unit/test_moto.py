@@ -1,0 +1,1561 @@
+from __future__ import annotations
+
+import copy
+import json
+import logging
+import os
+import time
+from datetime import datetime, timedelta, timezone
+from typing import TYPE_CHECKING
+from unittest import mock
+from unittest.mock import ANY, patch
+
+import boto3
+import botocore
+import moto
+import pandas as pd
+import pytest
+from botocore.exceptions import ClientError
+
+import awswrangler as wr
+from awswrangler._distributed import EngineEnum
+from awswrangler.exceptions import InvalidArgumentCombination, InvalidArgumentValue
+
+from .._utils import _get_unique_suffix, ensure_data_types, get_df_csv, get_df_list
+
+if TYPE_CHECKING:
+    from mypy_boto3_s3.client import S3Client
+
+logging.getLogger("awswrangler").setLevel(logging.DEBUG)
+
+
+@pytest.fixture(scope="module")
+def moto_aws():
+    with moto.mock_aws():
+        yield True
+
+
+@pytest.fixture(scope="module")
+def moto_subnet_id() -> str:
+    with moto.mock_aws():
+        ec2_client = boto3.client("ec2", region_name="us-west-1")
+
+        vpc_id = ec2_client.create_vpc(
+            CidrBlock="10.0.0.0/16",
+        )["Vpc"]["VpcId"]
+
+        subnet_id = ec2_client.create_subnet(
+            VpcId=vpc_id,
+            CidrBlock="10.0.0.0/24",
+            AvailabilityZone="us-west-1a",
+        )["Subnet"]["SubnetId"]
+
+        yield subnet_id
+
+
+@pytest.fixture(scope="function")
+def moto_s3_client() -> "S3Client":
+    with moto.mock_aws():
+        s3_client = boto3.client("s3", region_name="us-east-1")
+        s3_client.create_bucket(Bucket="bucket")
+        yield s3_client
+
+
+@pytest.fixture(scope="module")
+def moto_glue():
+    with moto.mock_aws():
+        region_name = "us-east-1"
+        with patch.dict(os.environ, {"AWS_DEFAULT_REGION": region_name}):
+            glue = boto3.client("glue", region_name=region_name)
+            yield glue
+
+
+@pytest.fixture(scope="function")
+def moto_dynamodb_client():
+    with moto.mock_aws():
+        dynamodb_client = boto3.client("dynamodb")
+        yield dynamodb_client
+
+
+@pytest.fixture(scope="function")
+def moto_dynamodb_table(moto_dynamodb_client):
+    table_name = f"table_{_get_unique_suffix()}"
+    moto_dynamodb_client.create_table(
+        TableName=table_name,
+        KeySchema=[{"AttributeName": "key", "KeyType": "HASH"}],
+        AttributeDefinitions=[{"AttributeName": "key", "AttributeType": "N"}],
+        BillingMode="PAY_PER_REQUEST",
+    )
+    yield table_name
+
+
+@pytest.fixture(scope="function")
+def local_timezone(request):
+    """Run a test under the local timezone named by the (indirect) parameter."""
+    if not hasattr(time, "tzset"):
+        pytest.skip("Changing the local timezone requires time.tzset(), which is not available on Windows.")
+    previous_tz = os.environ.get("TZ")
+    os.environ["TZ"] = request.param
+    time.tzset()
+    try:
+        if time.localtime().tm_gmtoff == 0:
+            pytest.skip(f"The timezone database has no entry for {request.param}.")
+        yield request.param
+    finally:
+        if previous_tz is None:
+            del os.environ["TZ"]
+        else:
+            os.environ["TZ"] = previous_tz
+        time.tzset()
+
+
+@pytest.fixture(scope="function")
+def moto_timestream_session():
+    with moto.mock_aws():
+        session = boto3.Session(region_name="us-east-1")
+        timestream_client = session.client("timestream-write")
+        timestream_client.create_database(DatabaseName="sampleDB")
+        timestream_client.create_table(DatabaseName="sampleDB", TableName="sampleTable")
+        yield session
+
+
+def get_content_md5(desc: dict):
+    result = desc.get("ResponseMetadata").get("HTTPHeaders").get("content-md5")
+    return result
+
+
+def test_get_bucket_region_succeed(moto_s3_client: "S3Client") -> None:
+    region = wr.s3.get_bucket_region("bucket", boto3_session=boto3.Session())
+    assert region == "us-east-1"
+
+
+def test_object_not_exist_succeed(moto_s3_client: "S3Client") -> None:
+    result = wr.s3.does_object_exist("s3://bucket/test.csv")
+    assert result is False
+
+
+def test_object_exist_succeed(moto_s3_client: "S3Client") -> None:
+    path = "s3://bucket/test.csv"
+    wr.s3.to_csv(df=get_df_csv(), path=path, index=False)
+    result = wr.s3.does_object_exist(path)
+    assert result is True
+
+
+@pytest.mark.parametrize(
+    "key",
+    ["s3://source/file.csv", "archive/s3://source/file.csv", "archive/s3://source/s3://file.csv", "s3://"],
+)
+def test_object_exist_with_s3_scheme_in_key(moto_s3_client: "S3Client", key: str) -> None:
+    moto_s3_client.put_object(Bucket="bucket", Key=key, Body=b"test")
+
+    assert wr.s3.does_object_exist(f"s3://bucket/{key}") is True
+
+
+def test_list_directories_succeed(moto_s3_client: "S3Client") -> None:
+    path = "s3://bucket"
+    moto_s3_client.put_object(
+        Bucket="bucket",
+        Key="foo/foo.tmp",
+        Body=b"foo",
+    )
+    moto_s3_client.put_object(
+        Bucket="bucket",
+        Key="bar/bar.tmp",
+        Body=b"bar",
+    )
+
+    dirs = wr.s3.list_directories(path)
+    files = wr.s3.list_objects(path)
+
+    assert sorted(dirs) == sorted(["s3://bucket/foo/", "s3://bucket/bar/"])
+    assert sorted(files) == sorted(["s3://bucket/foo/foo.tmp", "s3://bucket/bar/bar.tmp"])
+
+
+def test_describe_no_object_succeed(moto_s3_client: "S3Client") -> None:
+    desc = wr.s3.describe_objects("s3://bucket")
+
+    assert isinstance(desc, dict)
+    assert desc == {}
+
+
+def test_describe_one_object_succeed(moto_s3_client: "S3Client") -> None:
+    bucket = "bucket"
+    key = "foo/foo.tmp"
+    moto_s3_client.put_object(
+        Bucket=bucket,
+        Key=key,
+        Body=b"foo",
+    )
+
+    desc = wr.s3.describe_objects(f"s3://{bucket}/{key}")
+
+    assert isinstance(desc, dict)
+    assert list(desc.keys()) == ["s3://bucket/foo/foo.tmp"]
+
+
+def test_describe_list_of_objects_succeed(moto_s3_client: "S3Client") -> None:
+    bucket = "bucket"
+    keys = ["foo/foo.tmp", "bar/bar.tmp"]
+
+    for key in keys:
+        moto_s3_client.put_object(
+            Bucket=bucket,
+            Key=key,
+            Body=b"test",
+        )
+
+    desc = wr.s3.describe_objects([f"s3://{bucket}/{key}" for key in keys])
+
+    assert isinstance(desc, dict)
+    assert sorted(list(desc.keys())) == sorted(["s3://bucket/foo/foo.tmp", "s3://bucket/bar/bar.tmp"])
+
+
+def test_describe_list_of_objects_under_same_prefix_succeed(moto_s3_client: "S3Client") -> None:
+    bucket = "bucket"
+    keys = ["foo/foo.tmp", "bar/bar.tmp"]
+
+    for key in keys:
+        moto_s3_client.put_object(
+            Bucket=bucket,
+            Key=key,
+            Body=b"test",
+        )
+
+    desc = wr.s3.describe_objects(f"s3://{bucket}")
+
+    assert isinstance(desc, dict)
+    assert sorted(list(desc.keys())) == sorted(["s3://bucket/foo/foo.tmp", "s3://bucket/bar/bar.tmp"])
+
+
+def test_size_objects_without_object_succeed(moto_s3_client: "S3Client") -> None:
+    size = wr.s3.size_objects("s3://bucket")
+
+    assert isinstance(size, dict)
+    assert size == {}
+
+
+def test_size_list_of_objects_succeed(moto_s3_client: "S3Client") -> None:
+    bucket = "bucket"
+    moto_s3_client.put_object(
+        Bucket=bucket,
+        Key="foo/foo.tmp",
+        Body=b"foofoo",
+    )
+    moto_s3_client.put_object(
+        Bucket=bucket,
+        Key="bar/bar.tmp",
+        Body=b"bar",
+    )
+
+    size = wr.s3.size_objects(f"s3://{bucket}")
+
+    assert isinstance(size, dict)
+    assert size == {"s3://bucket/foo/foo.tmp": 6, "s3://bucket/bar/bar.tmp": 3}
+
+
+def test_copy_one_object_without_replace_filename_succeed(moto_s3_client: "S3Client") -> None:
+    bucket = "bucket"
+    key = "foo/foo.tmp"
+    moto_s3_client.put_object(
+        Bucket=bucket,
+        Key=key,
+        Body=b"foo",
+    )
+
+    wr.s3.copy_objects(
+        paths=[f"s3://{bucket}/{key}"],
+        source_path=f"s3://{bucket}/foo",
+        target_path="s3://bucket/bar",
+    )
+
+    desc_source = wr.s3.describe_objects("s3://bucket/foo/foo.tmp")
+    desc_target = wr.s3.describe_objects("s3://bucket/bar/foo.tmp")
+
+    assert get_content_md5(desc_target.get("s3://bucket/bar/foo.tmp")) == get_content_md5(
+        desc_source.get("s3://bucket/foo/foo.tmp")
+    )
+
+
+def test_copy_one_object_with_replace_filename_succeed(moto_s3_client: "S3Client") -> None:
+    bucket = "bucket"
+    key = "foo/foo.tmp"
+    moto_s3_client.put_object(
+        Bucket=bucket,
+        Key=key,
+        Body=b"foo",
+    )
+
+    wr.s3.copy_objects(
+        paths=[f"s3://{bucket}/{key}"],
+        source_path=f"s3://{bucket}/foo",
+        target_path="s3://bucket/bar",
+        replace_filenames={"foo.tmp": "bar.tmp"},
+    )
+
+    desc_source = wr.s3.describe_objects("s3://bucket/foo/foo.tmp")
+    desc_target = wr.s3.describe_objects("s3://bucket/bar/bar.tmp")
+
+    assert get_content_md5(desc_target.get("s3://bucket/bar/bar.tmp")) == get_content_md5(
+        desc_source.get("s3://bucket/foo/foo.tmp")
+    )
+
+
+def test_copy_objects_without_replace_filename_succeed(moto_s3_client: "S3Client") -> None:
+    bucket = "bucket"
+    keys = ["foo/foo1.tmp", "foo/foo2.tmp", "foo/foo3.tmp"]
+
+    for key in keys:
+        moto_s3_client.put_object(
+            Bucket=bucket,
+            Key=key,
+            Body=b"foo",
+        )
+
+    wr.s3.copy_objects(
+        paths=[f"s3://{bucket}/{key}" for key in keys],
+        source_path=f"s3://{bucket}/foo",
+        target_path="s3://bucket/bar",
+    )
+
+    desc_source = wr.s3.describe_objects(f"s3://{bucket}/foo")
+    desc_target = wr.s3.describe_objects(f"s3://{bucket}/bar")
+
+    assert isinstance(desc_target, dict)
+    assert len(desc_source) == 3
+    assert len(desc_target) == 3
+    assert sorted(list(desc_target.keys())) == sorted(
+        ["s3://bucket/bar/foo1.tmp", "s3://bucket/bar/foo2.tmp", "s3://bucket/bar/foo3.tmp"]
+    )
+
+
+def test_csv(moto_s3_client: "S3Client") -> None:
+    path = "s3://bucket/test.csv"
+    wr.s3.to_csv(df=get_df_csv(), path=path, index=False)
+    df = wr.s3.read_csv(path=path)
+    assert len(df.index) == 3
+    assert len(df.columns) == 10
+
+
+def test_download_file(moto_s3_client: "S3Client", tmp_path: str) -> None:
+    bucket = "bucket"
+    key = "foo.tmp"
+    content = b"foo"
+
+    moto_s3_client.put_object(
+        Bucket=bucket,
+        Key=key,
+        Body=content,
+    )
+
+    path = f"s3://{bucket}/{key}"
+    local_file = tmp_path / key
+    wr.s3.download(path=path, local_file=str(local_file))
+    assert local_file.read_bytes() == content
+
+
+def test_download_fileobj(moto_s3_client: "S3Client", tmp_path: str) -> None:
+    bucket = "bucket"
+    key = "foo.tmp"
+    content = b"foo"
+
+    moto_s3_client.put_object(
+        Bucket=bucket,
+        Key=key,
+        Body=content,
+    )
+
+    path = f"s3://{bucket}/{key}"
+    local_file = tmp_path / key
+
+    with open(local_file, "wb") as local_f:
+        wr.s3.download(path=path, local_file=local_f)
+    assert local_file.read_bytes() == content
+
+
+def test_upload_download_path(moto_s3_client: "S3Client", tmp_path) -> None:
+    path = "s3://bucket/foo.tmp"
+    src = tmp_path / "src.tmp"
+    src.write_bytes(b"foo")
+    wr.s3.upload(local_file=src, path=path)
+
+    dst = tmp_path / "dst.tmp"
+    wr.s3.download(path=path, local_file=dst)
+    assert dst.read_bytes() == b"foo"
+
+
+def test_upload_file(moto_s3_client: "S3Client", tmp_path: str) -> None:
+    bucket = "bucket"
+    key = "foo.tmp"
+    content = b"foo"
+
+    path = f"s3://{bucket}/{key}"
+    local_file = tmp_path / key
+
+    local_file.write_bytes(content)
+    wr.s3.upload(local_file=str(local_file), path=path)
+
+    response = moto_s3_client.get_object(
+        Bucket=bucket,
+        Key=key,
+    )
+    assert response["Body"].read() == content
+
+
+def test_upload_fileobj(moto_s3_client: "S3Client", tmp_path: str) -> None:
+    bucket = "bucket"
+    key = "foo.tmp"
+    content = b"foo"
+
+    path = f"s3://{bucket}/{key}"
+    local_file = tmp_path / key
+
+    local_file.write_bytes(content)
+    with open(local_file, "rb") as local_f:
+        wr.s3.upload(local_file=local_f, path=path)
+
+    response = moto_s3_client.get_object(
+        Bucket=bucket,
+        Key=key,
+    )
+    assert response["Body"].read() == content
+
+
+def test_read_csv_with_chucksize_and_pandas_arguments(moto_s3_client: "S3Client") -> None:
+    path = "s3://bucket/test.csv"
+    wr.s3.to_csv(df=get_df_csv(), path=path, index=False)
+    dfs = [dfs for dfs in wr.s3.read_csv(path=path, chunksize=1, usecols=["id", "string"])]
+    assert len(dfs) == 3
+    for df in dfs:
+        assert len(df.columns) == 2
+
+
+@pytest.mark.parametrize("chunksize", [None, 1])
+def test_read_csv_mixed_compression(moto_s3_client: "S3Client", chunksize: int | None) -> None:
+    df = pd.DataFrame({"id": [1, 2], "value": ["a", "b"]})
+    compressed = "s3://bucket/file1.csv.gz"
+    uncompressed = "s3://bucket/file2.csv"
+    wr.s3.to_csv(df=df, path=compressed, index=False, compression="gzip")
+    wr.s3.to_csv(df=df, path=uncompressed, index=False)
+    result = wr.s3.read_csv(path=[compressed, uncompressed], chunksize=chunksize, use_threads=False)
+    if chunksize is None:
+        assert len(result.index) == 4
+        assert list(result.columns) == ["id", "value"]
+    else:
+        chunks = list(result)
+        assert len(chunks) == 4
+        for chunk in chunks:
+            assert len(chunk.index) == 1
+            assert list(chunk.columns) == ["id", "value"]
+
+
+@pytest.mark.parametrize("chunksize", [None, 1])
+def test_read_json_mixed_compression(moto_s3_client: "S3Client", chunksize: int | None) -> None:
+    df = pd.DataFrame({"id": [1, 2], "value": ["a", "b"]})
+    compressed = "s3://bucket/file1.json.gz"
+    uncompressed = "s3://bucket/file2.json"
+    wr.s3.to_json(df=df, path=compressed, compression="gzip", orient="records", lines=True)
+    wr.s3.to_json(df=df, path=uncompressed, orient="records", lines=True)
+    result = wr.s3.read_json(
+        path=[compressed, uncompressed],
+        orient="records",
+        lines=True,
+        chunksize=chunksize,
+        use_threads=False,
+    )
+    if chunksize is None:
+        assert len(result.index) == 4
+        assert list(result.columns) == ["id", "value"]
+    else:
+        chunks = list(result)
+        assert len(chunks) == 4
+        for chunk in chunks:
+            assert len(chunk.index) == 1
+            assert list(chunk.columns) == ["id", "value"]
+
+
+@mock.patch("pandas.read_csv")
+@mock.patch("pandas.concat")
+def test_read_csv_pass_pandas_arguments_and_encoding_succeed(
+    mock_concat, mock_read_csv, moto_s3_client: "S3Client"
+) -> None:
+    bucket = "bucket"
+    key = "foo/foo.csv"
+    path = f"s3://{bucket}/{key}"
+    moto_s3_client.put_object(
+        Bucket=bucket,
+        Key=key,
+        Body=b"foo",
+    )
+    wr.s3.read_csv(path=path, encoding="ISO-8859-1", sep=",", lineterminator="\r\n")
+    mock_read_csv.assert_called_with(ANY, compression=None, encoding="ISO-8859-1", sep=",", lineterminator="\r\n")
+
+
+def test_to_csv_invalid_argument_combination_raise_when_dataset_false_succeed(moto_s3_client: "S3Client") -> None:
+    path = "s3://bucket/test.csv"
+
+    with pytest.raises(InvalidArgumentCombination):
+        wr.s3.to_csv(df=get_df_csv(), path=path, index=False, dataset=False, partition_cols=["par0", "par1"])
+
+    with pytest.raises(InvalidArgumentCombination):
+        wr.s3.to_csv(df=get_df_csv(), path=path, index=False, dataset=False, mode="append")
+
+    with pytest.raises(InvalidArgumentCombination):
+        wr.s3.to_csv(df=get_df_csv(), path=path, index=False, dataset=False, partition_cols=["par0", "par1"])
+
+    with pytest.raises(InvalidArgumentCombination):
+        wr.s3.to_csv(
+            df=get_df_csv(),
+            path=path,
+            index=False,
+            dataset=False,
+            database="default",
+            table="test",
+        )
+
+    with pytest.raises(InvalidArgumentCombination):
+        wr.s3.to_csv(
+            df=get_df_csv(),
+            path=path,
+            index=False,
+            dataset=False,
+            database=None,
+            table=None,
+            glue_table_settings=wr.typing.GlueTableSettings(description="raise exception"),
+        )
+
+    with pytest.raises(InvalidArgumentCombination):
+        wr.s3.to_csv(
+            df=get_df_csv(),
+            path=path,
+            index=False,
+            dataset=False,
+            database=None,
+            table=None,
+            glue_table_settings=wr.typing.GlueTableSettings(parameters={"key": "value"}),
+        )
+
+    with pytest.raises(InvalidArgumentCombination):
+        wr.s3.to_csv(
+            df=get_df_csv(),
+            path=path,
+            index=False,
+            dataset=False,
+            database=None,
+            table=None,
+            glue_table_settings=wr.typing.GlueTableSettings(columns_comments={"col0": "test"}),
+        )
+
+
+def test_to_csv_valid_argument_combination_when_dataset_true_succeed(moto_s3_client: "S3Client") -> None:
+    path = "s3://bucket/test.csv"
+    wr.s3.to_csv(df=get_df_csv(), path=path, index=False)
+    wr.s3.to_csv(df=get_df_csv(), path=path, index=False, dataset=True, partition_cols=["par0", "par1"])
+
+    wr.s3.to_csv(df=get_df_csv(), path=path, index=False, dataset=True, mode="append")
+
+
+def test_path2list_suffix_with_list_of_paths(moto_s3_client: "S3Client") -> None:
+    paths = ["s3://bucket/file1.parquet", "s3://bucket/file2.txt", "s3://bucket/file3.csv"]
+
+    # 1. suffix only
+    result1 = wr.s3._list._path2list(
+        path=paths,
+        s3_client=moto_s3_client,
+        s3_additional_kwargs=None,
+        suffix=".parquet",
+    )
+    assert result1 == ["s3://bucket/file1.parquet"]
+
+    # 2. list of suffixes
+    result2 = wr.s3._list._path2list(
+        path=paths,
+        s3_client=moto_s3_client,
+        s3_additional_kwargs=None,
+        suffix=[".parquet", ".csv"],
+    )
+    assert result2 == ["s3://bucket/file1.parquet", "s3://bucket/file3.csv"]
+
+    # 3. suffix and ignore_suffix combined
+    result3 = wr.s3._list._path2list(
+        path=paths,
+        s3_client=moto_s3_client,
+        s3_additional_kwargs=None,
+        suffix=[".parquet", ".txt"],
+        ignore_suffix=".txt",
+    )
+    assert result3 == ["s3://bucket/file1.parquet"]
+
+
+def test_to_csv_data_empty(moto_s3_client: "S3Client") -> None:
+    path = "s3://bucket/test.csv"
+    wr.s3.to_csv(df=pd.DataFrame(), path=path, index=False)
+
+
+def test_parquet(moto_s3_client: "S3Client") -> None:
+    path = "s3://bucket/test.parquet"
+    wr.s3.to_parquet(df=get_df_list(), path=path, index=False, dataset=True, partition_cols=["par0", "par1"])
+    df = wr.s3.read_parquet(path=path, dataset=True)
+    ensure_data_types(df, has_list=True)
+    assert df.shape == (3, 19)
+
+
+def test_parquet_with_size(moto_s3_client: "S3Client") -> None:
+    path = "s3://bucket/test.parquet"
+    df = get_df_list()
+    df = pd.concat([df for _ in range(21)])
+    wr.s3.to_parquet(df=df, path=path, index=False, dataset=False, max_rows_by_file=10)
+    df = wr.s3.read_parquet(path="s3://bucket/", dataset=False)
+    ensure_data_types(df, has_list=True)
+    assert df.shape == (63, 19)
+
+
+def test_s3_delete_object_success(moto_s3_client: "S3Client") -> None:
+    path = "s3://bucket/test.parquet"
+    wr.s3.to_parquet(df=get_df_list(), path=path, index=False, dataset=True, partition_cols=["par0", "par1"])
+    df = wr.s3.read_parquet(path=path, dataset=True)
+    ensure_data_types(df, has_list=True)
+    wr.s3.delete_objects(path=path)
+    with pytest.raises(wr.exceptions.NoFilesFound):
+        wr.s3.read_parquet(path=path, dataset=True)
+
+
+def test_s3_delete_objects_additional_kwargs(moto_s3_client: "S3Client") -> None:
+    path = "s3://bucket/test_kwargs.txt"
+    moto_s3_client.put_object(Bucket="bucket", Key="test_kwargs.txt", Body=b"test")
+
+    orig_client = wr._utils.client
+    captured_kwargs = {}
+
+    def custom_client(service_name: str, session: boto3.Session | None = None) -> "S3Client":
+        client = orig_client(service_name, session)
+        if service_name == "s3":
+            orig_delete = client.delete_objects
+
+            def mock_delete(**kwargs):
+                nonlocal captured_kwargs
+                captured_kwargs = kwargs
+                return orig_delete(**kwargs)
+
+            client.delete_objects = mock_delete
+        return client  # type: ignore[return-value]
+
+    with patch("awswrangler.s3._delete._utils.client", side_effect=custom_client):
+        wr.s3.delete_objects(
+            path=path,
+            s3_additional_kwargs={"BypassGovernanceRetention": True, "RequestPayer": "requester", "Delimiter": "/"},
+        )
+
+    assert captured_kwargs.get("BypassGovernanceRetention") is True
+    assert captured_kwargs.get("RequestPayer") == "requester"
+    assert "Delimiter" not in captured_kwargs
+
+
+@pytest.mark.parametrize("chunked", [True, False])
+def test_s3_parquet_empty_table(moto_s3_client: "S3Client", chunked) -> None:
+    path = "s3://bucket/file.parquet"
+
+    r_df = pd.DataFrame({"id": []}, dtype=pd.Int64Dtype())
+    wr.s3.to_parquet(df=r_df, path=path)
+
+    df = wr.s3.read_parquet(path, chunked=chunked)
+    if chunked:
+        df = pd.concat(list(df))
+
+    pd.testing.assert_frame_equal(r_df, df, check_dtype=True)
+
+
+def test_s3_dataset_empty_table(moto_s3_client: "S3Client") -> None:
+    """Test that a dataset split into multiple parquet files whose first
+    partition is an empty table still loads properly.
+    """
+    partition_col, partition_val = "col0", "1"
+    dataset = f"{partition_col}={partition_val}"
+    s3_key = f"s3://bucket/{dataset}"
+
+    # Use "string" (not "string[python]") because PyArrow does not preserve
+    # the storage backend in its pandas metadata, so the round-trip dtype
+    # is always the default StringDtype.
+    dtypes = {"id": "string"}
+    df1 = pd.DataFrame({"id": []}).astype(dtypes)
+    df2 = pd.DataFrame({"id": ["1"] * 2}).astype(dtypes)
+    df3 = pd.DataFrame({"id": ["1"] * 3}).astype(dtypes)
+
+    dataframes = [df1, df2, df3]
+    r_df = pd.concat(dataframes, ignore_index=True)
+    r_df = r_df.assign(col0=pd.Categorical([partition_val] * len(r_df)))
+
+    for i, df in enumerate(dataframes):
+        wr.s3.to_parquet(
+            df=df,
+            path=f"{s3_key}/part{i}.parquet",
+        )
+
+    result_df = wr.s3.read_parquet(path=s3_key, dataset=True)
+    pd.testing.assert_frame_equal(result_df, r_df, check_dtype=True)
+
+
+def test_s3_raise_delete_object_exception_success(moto_s3_client: "S3Client") -> None:
+    path = "s3://bucket/test.parquet"
+    wr.s3.to_parquet(df=get_df_list(), path=path, index=False, dataset=True, partition_cols=["par0", "par1"])
+    df = wr.s3.read_parquet(path=path, dataset=True)
+    ensure_data_types(df, has_list=True)
+
+    call = botocore.client.BaseClient._make_api_call
+
+    def mock_make_api_call(self, operation_name, kwarg):
+        if operation_name == "DeleteObjects":
+            parsed_response = {"Error": {"Code": "500", "Message": "Test Error"}}
+            raise ClientError(parsed_response, operation_name)
+        return call(self, operation_name, kwarg)
+
+    with mock.patch("botocore.client.BaseClient._make_api_call", new=mock_make_api_call):
+        with pytest.raises(ClientError):
+            wr.s3.delete_objects(path=path)
+
+
+def test_emr(moto_s3_client: "S3Client", moto_aws, moto_subnet_id: str) -> None:
+    session = boto3.Session(region_name="us-west-1")
+    cluster_id = wr.emr.create_cluster(
+        cluster_name="wrangler_cluster",
+        logging_s3_path="s3://bucket/emr-logs/",
+        emr_release="emr-5.29.0",
+        subnet_id=moto_subnet_id,
+        emr_ec2_role="EMR_EC2_DefaultRole",
+        emr_role="EMR_DefaultRole",
+        instance_type_master="m5.xlarge",
+        instance_type_core="m5.xlarge",
+        instance_type_task="m5.xlarge",
+        instance_ebs_size_master=50,
+        instance_ebs_size_core=50,
+        instance_ebs_size_task=50,
+        instance_num_on_demand_master=1,
+        instance_num_on_demand_core=0,
+        instance_num_on_demand_task=0,
+        instance_num_spot_master=0,
+        instance_num_spot_core=0,
+        instance_num_spot_task=0,
+        spot_bid_percentage_of_on_demand_master=100,
+        spot_bid_percentage_of_on_demand_core=100,
+        spot_bid_percentage_of_on_demand_task=100,
+        spot_provisioning_timeout_master=5,
+        spot_provisioning_timeout_core=5,
+        spot_provisioning_timeout_task=5,
+        spot_timeout_to_on_demand_master=False,
+        spot_timeout_to_on_demand_core=False,
+        spot_timeout_to_on_demand_task=False,
+        python3=False,
+        spark_glue_catalog=False,
+        hive_glue_catalog=False,
+        presto_glue_catalog=False,
+        consistent_view=True,
+        consistent_view_retry_count=6,
+        consistent_view_retry_seconds=15,
+        consistent_view_table_name="EMRConsistentView",
+        bootstraps_paths=None,
+        debugging=False,
+        applications=["Hadoop", "Spark", "Ganglia", "Hive"],
+        visible_to_all_users=True,
+        key_pair_name=None,
+        spark_log_level="ERROR",
+        spark_jars_path=["s3://bucket/jars/"],
+        spark_defaults={"spark.default.parallelism": "400"},
+        maximize_resource_allocation=True,
+        keep_cluster_alive_when_no_steps=False,
+        termination_protected=False,
+        spark_pyarrow=False,
+        tags={"foo": "boo", "bar": "xoo"},
+        boto3_session=session,
+    )
+    wr.emr.get_cluster_state(cluster_id=cluster_id, boto3_session=session)
+    steps = []
+    for cmd in ['echo "Hello"', "ls -la"]:
+        steps.append(wr.emr.build_step(name=cmd, command=cmd))
+    wr.emr.submit_steps(cluster_id=cluster_id, steps=steps, boto3_session=session)
+    wr.emr.terminate_cluster(cluster_id=cluster_id, boto3_session=session)
+    wr.s3.delete_objects("s3://bucket/emr-logs/")
+
+
+def test_glue_get_partition(moto_glue):
+    database_name = "mydb"
+    table_name = "mytable"
+    values = {"s3://bucket/prefix/dt=2020-01-01": ["2020-01-01"]}
+
+    wr.catalog.create_database(name=database_name)
+    wr.catalog.create_parquet_table(
+        database=database_name,
+        table=table_name,
+        path="s3://bucket/prefix/",
+        columns_types={"col0": "bigint", "col1": "double"},
+        partitions_types={"dt": "date"},
+    )
+    wr.catalog.add_parquet_partitions(database=database_name, table=table_name, partitions_values=values)
+
+    partition_value = wr.catalog.get_partitions(database_name, table_name)
+    assert partition_value == values
+    parquet_partition_value = wr.catalog.get_parquet_partitions(database_name, table_name)
+    assert parquet_partition_value == values
+
+
+def test_glue_add_column_without_comment(moto_glue):
+    database_name = "mydb_add_col"
+    table_name = "mytable_add_col"
+
+    wr.catalog.create_database(name=database_name)
+    wr.catalog.create_parquet_table(
+        database=database_name,
+        table=table_name,
+        path="s3://bucket/prefix/",
+        columns_types={"col0": "bigint"},
+    )
+    wr.catalog.add_column(
+        database=database_name,
+        table=table_name,
+        column_name="col1",
+        column_type="string",
+    )
+    wr.catalog.add_column(
+        database=database_name,
+        table=table_name,
+        column_name="col2",
+        column_type="double",
+        column_comment="column comment",
+    )
+    dtypes = wr.catalog.get_table_types(database=database_name, table=table_name)
+    assert dtypes == {"col0": "bigint", "col1": "string", "col2": "double"}
+    comments = wr.catalog.get_columns_comments(database=database_name, table=table_name)
+    assert comments.get("col2") == "column comment"
+    assert "col1" not in comments or comments.get("col1") is None
+
+
+def test_dynamodb_basic_usage(moto_dynamodb_client, moto_dynamodb_table):
+    items = [{"key": 1}, {"key": 2, "my_value": "Hello"}]
+
+    wr.dynamodb.put_items(items=items, table_name=moto_dynamodb_table)
+    table = wr.dynamodb.get_table(table_name=moto_dynamodb_table)
+    assert table.item_count == len(items)
+
+    wr.dynamodb.delete_items(items=items, table_name=moto_dynamodb_table)
+    table = wr.dynamodb.get_table(table_name=moto_dynamodb_table)
+    assert table.item_count == 0
+
+
+def test_dynamodb_fail_on_invalid_items(moto_dynamodb_client, moto_dynamodb_table):
+    items = [{"key": 1}, {"id": 2}]
+
+    with pytest.raises(InvalidArgumentValue):
+        wr.dynamodb.put_items(items=items, table_name=moto_dynamodb_table)
+
+
+def mock_data_api_connector(connector, has_result_set=True):
+    request_id = "1234"
+    statement_response = {"ColumnMetadata": [{"name": "col1"}], "Records": [[{"stringValue": "test"}]]}
+    column_names = [column["name"] for column in statement_response["ColumnMetadata"]]
+    data = [[col["stringValue"] for col in record] for record in statement_response["Records"]]
+    response_dataframe = pd.DataFrame(data, columns=column_names)
+
+    if isinstance(connector, wr.data_api.redshift.RedshiftDataApi):
+        connector.client.execute_statement = mock.MagicMock(return_value={"Id": request_id})
+        connector.client.describe_statement = mock.MagicMock(
+            return_value={"Status": "FINISHED", "HasResultSet": has_result_set}
+        )
+        connector.client.get_statement_result = mock.MagicMock(return_value=statement_response)
+    elif isinstance(connector, wr.data_api.rds.RdsDataApi):
+        records = statement_response["Records"]
+        metadata = statement_response["ColumnMetadata"]
+        del statement_response["Records"]
+        del statement_response["ColumnMetadata"]
+        if has_result_set:
+            statement_response["columnMetadata"] = metadata
+            statement_response["records"] = records
+        connector.client.execute_statement = mock.MagicMock(return_value=statement_response)
+    else:
+        raise ValueError(f"Unsupported connector type {type(connector)}")
+
+    return response_dataframe
+
+
+def test_data_api_redshift_create_connection():
+    cluster_id = "cluster123"
+    con = wr.data_api.redshift.connect(cluster_id=cluster_id, database="db1", db_user="admin")
+    assert con.cluster_id == cluster_id
+
+
+def test_data_api_redshift_read_sql_results():
+    cluster_id = "cluster123"
+    con = wr.data_api.redshift.connect(cluster_id=cluster_id, database="db1", db_user="admin")
+    expected_dataframe = mock_data_api_connector(con)
+    dataframe = wr.data_api.redshift.read_sql_query("SELECT * FROM test", con=con)
+    pd.testing.assert_frame_equal(dataframe, expected_dataframe)
+
+
+def test_data_api_redshift_read_sql_no_results():
+    cluster_id = "cluster123"
+    con = wr.data_api.redshift.connect(cluster_id=cluster_id, database="db1", db_user="admin")
+    mock_data_api_connector(con, has_result_set=False)
+    dataframe = wr.data_api.redshift.read_sql_query("DROP TABLE test", con=con)
+    assert dataframe.empty is True
+
+
+def test_data_api_rds_create_connection():
+    resource_arn = "arn123"
+    conn = wr.data_api.rds.connect(resource_arn, "db1", secret_arn="arn123")
+    assert conn.resource_arn == resource_arn
+
+
+def test_data_api_rds_read_sql_results():
+    resource_arn = "arn123"
+    con = wr.data_api.rds.connect(resource_arn, "db1", secret_arn="arn123")
+    expected_dataframe = mock_data_api_connector(con)
+    dataframe = wr.data_api.rds.read_sql_query("SELECT * FROM test", con=con)
+    pd.testing.assert_frame_equal(dataframe, expected_dataframe)
+
+
+def test_data_api_rds_read_sql_no_results():
+    resource_arn = "arn123"
+    con = wr.data_api.rds.connect(resource_arn, "db1", secret_arn="arn123")
+    mock_data_api_connector(con, has_result_set=False)
+    dataframe = wr.data_api.rds.read_sql_query("DROP TABLE test", con=con)
+    assert dataframe.empty is True
+
+
+def test_create_athena_bucket_owned_by_caller_succeed(moto_aws) -> None:
+    region = "us-east-1"
+    session = boto3.Session(region_name=region)
+    account_id = boto3.client("sts", region_name=region).get_caller_identity()["Account"]
+
+    path = wr.athena.create_athena_bucket(boto3_session=session)
+
+    assert path == f"s3://aws-athena-query-results-{account_id}-{region}/"
+    # The bucket must exist and be owned by the caller (moto's default account).
+    s3 = session.client("s3")
+    s3.head_bucket(Bucket=f"aws-athena-query-results-{account_id}-{region}", ExpectedBucketOwner=account_id)
+
+
+def test_extract_ctas_manifest_paths_same_bucket_succeed(moto_s3_client: "S3Client") -> None:
+    from awswrangler.athena._read import _extract_ctas_manifest_paths
+
+    manifest_key = "manifest.csv"
+    manifest_body = "s3://bucket/results/part-0.parquet\ns3://bucket/results/part-1.parquet\n"
+    moto_s3_client.put_object(Bucket="bucket", Key=manifest_key, Body=manifest_body.encode("utf-8"))
+
+    paths = _extract_ctas_manifest_paths(path=f"s3://bucket/{manifest_key}")
+
+    assert paths == [
+        "s3://bucket/results/part-0.parquet",
+        "s3://bucket/results/part-1.parquet",
+    ]
+
+
+def test_extract_ctas_manifest_paths_cross_bucket_raises(moto_s3_client: "S3Client") -> None:
+    """A manifest that redirects reads to another bucket must be rejected."""
+    from awswrangler.athena._read import _extract_ctas_manifest_paths
+
+    manifest_key = "manifest.csv"
+    manifest_body = "s3://attacker-bucket/poison/part-0.parquet\n"
+    moto_s3_client.put_object(Bucket="bucket", Key=manifest_key, Body=manifest_body.encode("utf-8"))
+
+    with pytest.raises(InvalidArgumentValue, match="unexpected bucket"):
+        _extract_ctas_manifest_paths(path=f"s3://bucket/{manifest_key}")
+
+
+def test_dynamodb_read_items_with_key_schema(moto_dynamodb_client, moto_dynamodb_table) -> None:
+    # Insert items
+    items = [{"key": 1, "value": "A"}, {"key": 2, "value": "B"}]
+    wr.dynamodb.put_items(items=items, table_name=moto_dynamodb_table)
+
+    # 1. Verify read_items works with key_schema passed
+    key_schema = [{"AttributeName": "key", "KeyType": "HASH"}]
+    df = wr.dynamodb.read_items(
+        table_name=moto_dynamodb_table,
+        key_schema=key_schema,
+        allow_full_scan=True,
+    )
+    assert len(df) == 2
+    assert set(df["value"]) == {"A", "B"}
+
+    # 2. Assert DescribeTable is NOT called when key_schema is provided
+    call = botocore.client.BaseClient._make_api_call
+    describe_table_calls = 0
+
+    def mock_make_api_call(self, operation_name, kwarg):
+        nonlocal describe_table_calls
+        if operation_name == "DescribeTable":
+            describe_table_calls += 1
+        return call(self, operation_name, kwarg)
+
+    with mock.patch("botocore.client.BaseClient._make_api_call", new=mock_make_api_call):
+        # Call read_items with key_schema
+        wr.dynamodb.read_items(
+            table_name=moto_dynamodb_table,
+            key_schema=key_schema,
+            allow_full_scan=True,
+        )
+        assert describe_table_calls == 0
+
+        # Call read_items WITHOUT key_schema
+        wr.dynamodb.read_items(
+            table_name=moto_dynamodb_table,
+            allow_full_scan=True,
+        )
+        assert describe_table_calls == 1
+
+
+def test_create_iceberg_table_escapes_single_quotes_in_columns_comments() -> None:
+    # Single quotes in caller-supplied columns_comments / additional_table_properties
+    # values must be doubled so they cannot terminate the surrounding 'literal' and
+    # change the structure of the generated DDL.
+    from awswrangler.athena import _write_iceberg
+
+    captured: list[str] = []
+
+    def fake_start(*, sql: str, **_) -> str:
+        captured.append(sql)
+        return "qid"
+
+    df = pd.DataFrame({"id": pd.Series(dtype="int64"), "user_name": pd.Series(dtype="string")})
+    wg_config = mock.MagicMock()
+    wg_config.enforce_workgroup_location = False
+
+    with mock.patch.object(_write_iceberg, "_start_query_execution", side_effect=fake_start), mock.patch.object(
+        _write_iceberg, "wait_query"
+    ):
+        _write_iceberg._create_iceberg_table(
+            df=df,
+            database="db",
+            table="t",
+            path="s3://intended/output/",
+            wg_config=wg_config,
+            partition_cols=None,
+            additional_table_properties={"prop": "val') LOCATION 's3://other/' --"},
+            index=False,
+            boto3_session=mock.MagicMock(),
+            columns_comments={"user_name": "') LOCATION 's3://other/' TBLPROPERTIES ('x'='y"},
+        )
+
+    sql = captured[0]
+    # Quotes were doubled in both splices, so unescaped caller content stays inside the
+    # COMMENT / TBLPROPERTIES string literals and does not open a new DDL clause.
+    assert "COMMENT ''') LOCATION ''s3://other/'' TBLPROPERTIES (''x''=''y'" in sql
+    assert "'prop'='val'') LOCATION ''s3://other/'' --'" in sql
+    # The intended LOCATION (un-doubled quotes) is the only top-level clause.
+    assert "LOCATION 's3://intended/output/'" in sql
+    assert "LOCATION 's3://other/'" not in sql
+
+
+def test_dynamodb_read_items_max_items_evaluated_zero(moto_dynamodb_client, moto_dynamodb_table) -> None:
+    items = [{"key": 1, "value": "A"}, {"key": 2, "value": "B"}]
+    wr.dynamodb.put_items(items=items, table_name=moto_dynamodb_table)
+
+    # 1. max_items_evaluated=0 without allow_full_scan
+    df0 = wr.dynamodb.read_items(table_name=moto_dynamodb_table, max_items_evaluated=0)
+    assert isinstance(df0, pd.DataFrame)
+    assert len(df0) == 0
+
+    # 2. max_items_evaluated=0 with allow_full_scan=True
+    df0_scan = wr.dynamodb.read_items(table_name=moto_dynamodb_table, max_items_evaluated=0, allow_full_scan=True)
+    assert isinstance(df0_scan, pd.DataFrame)
+    assert len(df0_scan) == 0
+
+    # 3. max_items_evaluated=0 as_dataframe=False
+    items0 = wr.dynamodb.read_items(table_name=moto_dynamodb_table, max_items_evaluated=0, as_dataframe=False)
+    assert items0 == []
+
+    # 4. max_items_evaluated=0 chunked=True
+    chunks = list(wr.dynamodb.read_items(table_name=moto_dynamodb_table, max_items_evaluated=0, chunked=True))
+    assert len(chunks) == 1
+    assert len(chunks[0]) == 0
+
+    # 5. max_items_evaluated=-1 raises InvalidArgumentValue
+    with pytest.raises(wr.exceptions.InvalidArgumentValue):
+        wr.dynamodb.read_items(table_name=moto_dynamodb_table, max_items_evaluated=-1)
+
+
+def test_dynamodb_read_items_missing_single_key(moto_dynamodb_client, moto_dynamodb_table) -> None:
+    wr.dynamodb.put_items(items=[{"key": 1, "value": "A"}], table_name=moto_dynamodb_table)
+
+    items = wr.dynamodb.read_items(table_name=moto_dynamodb_table, partition_values=[2], as_dataframe=False)
+    assert items == []
+
+    chunks = list(
+        wr.dynamodb.read_items(table_name=moto_dynamodb_table, partition_values=[2], as_dataframe=False, chunked=True)
+    )
+    assert chunks == [[]]
+
+    df = wr.dynamodb.read_items(table_name=moto_dynamodb_table, partition_values=[2])
+    assert len(df) == 0
+
+    # Same result as when several missing keys go through BatchGetItem
+    items = wr.dynamodb.read_items(table_name=moto_dynamodb_table, partition_values=[2, 3], as_dataframe=False)
+    assert items == []
+
+
+@pytest.mark.parametrize("chunked", [False, True])
+def test_dynamodb_read_items_more_than_100_partition_values(moto_dynamodb_client, moto_dynamodb_table, chunked) -> None:
+    # BatchGetItem accepts at most 100 keys per request
+    items = [{"key": i, "value": f"v{i}"} for i in range(250)]
+    wr.dynamodb.put_items(items=items, table_name=moto_dynamodb_table)
+
+    result = wr.dynamodb.read_items(
+        table_name=moto_dynamodb_table,
+        partition_values=[item["key"] for item in items],
+        as_dataframe=False,
+        chunked=chunked,
+    )
+    if chunked:
+        result = [item for chunk in result for item in chunk]
+
+    assert len(result) == len(items)
+    assert sorted(int(item["key"]) for item in result) == list(range(250))
+
+
+def _capture_timestream_write_records(session: boto3.Session) -> list:
+    captured: list = []
+
+    def _handler(params, **kwargs) -> None:
+        # Deep copy so that a shared mutable `CommonAttributes` cannot be observed post-hoc.
+        captured.append(copy.deepcopy(params))
+
+    session.events.register("provide-client-params.timestream-write.WriteRecords", _handler)
+    return captured
+
+
+def _timestream_df() -> pd.DataFrame:
+    return pd.DataFrame(
+        {
+            # Timezone-aware so that the formatted epoch value does not depend on the local timezone.
+            "time": [datetime(2024, 1, 1, tzinfo=timezone.utc)],
+            "cpu": [1.0],
+            "mem": [2.0],
+        }
+    )
+
+
+def test_timestream_write_does_not_mutate_common_attributes(moto_timestream_session: boto3.Session) -> None:
+    common_attributes = {"Dimensions": [{"Name": "host", "Value": "h1", "DimensionValueType": "VARCHAR"}]}
+    expected = copy.deepcopy(common_attributes)
+
+    rejected_records = wr.timestream.write(
+        df=_timestream_df(),
+        database="sampleDB",
+        table="sampleTable",
+        time_col="time",
+        measure_col="cpu",
+        common_attributes=common_attributes,
+        boto3_session=moto_timestream_session,
+        use_threads=False,
+    )
+
+    assert rejected_records == []
+    assert common_attributes == expected
+
+
+def test_timestream_write_common_attributes_reused_across_calls(moto_timestream_session: boto3.Session) -> None:
+    captured = _capture_timestream_write_records(moto_timestream_session)
+    common_attributes = {"Dimensions": [{"Name": "host", "Value": "h1", "DimensionValueType": "VARCHAR"}]}
+
+    wr.timestream.write(
+        df=_timestream_df(),
+        database="sampleDB",
+        table="sampleTable",
+        time_col="time",
+        measure_col="cpu",
+        common_attributes=common_attributes,
+        boto3_session=moto_timestream_session,
+        use_threads=False,
+    )
+    wr.timestream.write(
+        df=_timestream_df(),
+        database="sampleDB",
+        table="sampleTable",
+        time_col="time",
+        measure_col="mem",
+        version=5,
+        time_unit="MICROSECONDS",
+        common_attributes=common_attributes,
+        boto3_session=moto_timestream_session,
+        use_threads=False,
+    )
+
+    assert len(captured) == 2
+    first, second = captured
+
+    assert first["CommonAttributes"]["MeasureName"] == "cpu"
+    assert first["CommonAttributes"]["TimeUnit"] == "MILLISECONDS"
+    assert first["CommonAttributes"]["Version"] == 1
+    assert first["Records"][0]["Time"] == "1704067200000"
+
+    # The second call must honor its own arguments instead of the defaults resolved for the first one.
+    assert second["CommonAttributes"]["MeasureName"] == "mem"
+    assert second["CommonAttributes"]["TimeUnit"] == "MICROSECONDS"
+    assert second["CommonAttributes"]["Version"] == 5
+    assert second["Records"][0]["Time"] == "1704067200000000"
+
+
+def test_timestream_write_common_attributes_take_precedence(moto_timestream_session: boto3.Session) -> None:
+    captured = _capture_timestream_write_records(moto_timestream_session)
+    common_attributes = {
+        "Dimensions": [{"Name": "host", "Value": "h1", "DimensionValueType": "VARCHAR"}],
+        "MeasureName": "from_common_attributes",
+        "TimeUnit": "SECONDS",
+        "Version": 9,
+    }
+    expected = copy.deepcopy(common_attributes)
+
+    wr.timestream.write(
+        df=_timestream_df(),
+        database="sampleDB",
+        table="sampleTable",
+        time_col="time",
+        measure_col="cpu",
+        measure_name="from_argument",
+        version=1,
+        time_unit="MILLISECONDS",
+        common_attributes=common_attributes,
+        boto3_session=moto_timestream_session,
+        use_threads=False,
+    )
+
+    assert common_attributes == expected
+    assert captured[0]["CommonAttributes"]["MeasureName"] == "from_common_attributes"
+    assert captured[0]["CommonAttributes"]["TimeUnit"] == "SECONDS"
+    assert captured[0]["CommonAttributes"]["Version"] == 9
+    assert captured[0]["Records"][0]["Time"] == "1704067200"
+
+
+def test_redshift_copy_escapes_path_literal() -> None:
+    from awswrangler.redshift._write import _copy
+
+    cursor = mock.MagicMock()
+    # A single quote in the path must not be able to terminate the COPY string literal.
+    _copy(
+        cursor=cursor,
+        path="s3://bucket/o'brien/",
+        table="t",
+        serialize_to_json=False,
+        iam_role="arn:aws:iam::123456789012:role/example",
+    )
+    executed_sql = cursor.execute.call_args[0][0]
+    assert "FROM 's3://bucket/o''brien/'" in executed_sql
+    assert "o'brien" not in executed_sql.replace("o''brien", "")
+
+
+def test_secretsmanager_get_secret_binary(moto_aws) -> None:
+    session = boto3.Session(region_name="us-east-1")
+    # Bytes that are not valid base64 input; the previous double-decode silently returned b"".
+    raw = bytes(range(8))
+    session.client("secretsmanager").create_secret(Name="aws-sdk-pandas/binary-secret", SecretBinary=raw)
+
+    assert wr.secretsmanager.get_secret("aws-sdk-pandas/binary-secret", boto3_session=session) == raw
+
+
+def test_secretsmanager_get_secret_string(moto_aws) -> None:
+    session = boto3.Session(region_name="us-east-1")
+    session.client("secretsmanager").create_secret(Name="aws-sdk-pandas/string-secret", SecretString="p@ssw0rd")
+
+    assert wr.secretsmanager.get_secret("aws-sdk-pandas/string-secret", boto3_session=session) == "p@ssw0rd"
+
+
+@pytest.mark.parametrize(
+    "engine, ssl_value, expect_tls",
+    [
+        ("mysql", True, True),
+        ("mysql", "true", True),
+        ("mysql", "True", True),
+        ("mysql", False, False),
+        ("mysql", "false", False),
+        ("mysql", None, False),
+        ("aurora-mysql", True, True),
+        # ssl_context is only consumed by the MySQL connector; other engines must not set it
+        ("postgresql", True, False),
+        ("sqlserver", True, False),
+    ],
+)
+def test_connection_attributes_from_secret_ssl(moto_aws, engine, ssl_value, expect_tls) -> None:
+    session = boto3.Session(region_name="us-east-1")
+    secret = {
+        "engine": engine,
+        "host": "db-instance.us-east-1.rds.amazonaws.com",
+        "username": "test",
+        "password": "test",
+        "port": "3306",
+        "dbname": "mydb",
+    }
+    if ssl_value is not None:
+        secret["ssl"] = ssl_value
+    secret_name = f"aws-sdk-pandas/db-secret-ssl-{engine}-{type(ssl_value).__name__}-{ssl_value}"
+    session.client("secretsmanager").create_secret(Name=secret_name, SecretString=json.dumps(secret))
+
+    attrs = wr._databases._get_connection_attributes_from_secrets_manager(
+        secret_id=secret_name, dbname=None, boto3_session=session
+    )
+    if expect_tls:
+        assert attrs.ssl_context is not None
+    else:
+        assert attrs.ssl_context is None
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"aws_access_key_id": "AKIA_EXAMPLE"},
+        {"aws_secret_access_key": "secret_example"},
+    ],
+)
+def test_redshift_auth_string_partial_credentials(kwargs) -> None:
+    from awswrangler.redshift._utils import _make_s3_auth_string
+
+    # Supplying only one of the access-key pair previously fell through to ambient
+    # session credentials silently; it must now fail loudly.
+    with pytest.raises(wr.exceptions.InvalidArgument):
+        _make_s3_auth_string(**kwargs)
+
+
+def test_redshift_auth_string_full_credentials() -> None:
+    from awswrangler.redshift._utils import _make_s3_auth_string
+
+    auth_str = _make_s3_auth_string(aws_access_key_id="AKIA_EXAMPLE", aws_secret_access_key="secret_example")
+    assert "ACCESS_KEY_ID 'AKIA_EXAMPLE'" in auth_str
+    assert "SECRET_ACCESS_KEY 'secret_example'" in auth_str
+
+
+# boto3_session/s3_additional_kwargs are rejected up-front in distributed mode,
+# so the forwarding under test is only reachable on the python engine.
+@mock.patch("awswrangler.neptune._neptune.bulk_load_from_files")
+@mock.patch("awswrangler.neptune._neptune.s3.delete_objects")
+@mock.patch("awswrangler.neptune._neptune.s3.to_csv")
+@mock.patch("awswrangler.neptune._neptune.s3.list_objects", return_value=[])
+@mock.patch("awswrangler._distributed.engine.get", return_value=EngineEnum.PYTHON)
+def test_neptune_bulk_load_forwards_session_and_s3_kwargs(
+    engine_get, list_objects, to_csv, delete_objects, bulk_load_from_files
+) -> None:
+    # bulk_load is gated on the sparql extra, which minimal CI does not install.
+    pytest.importorskip("SPARQLWrapper")
+
+    df = pd.DataFrame({"~id": ["0"], "~label": ["v"]})
+    session = boto3.Session(region_name="us-east-1")
+    s3_kwargs = {"ServerSideEncryption": "aws:kms", "SSEKMSKeyId": "arn:aws:kms:us-east-1:123456789012:key/x"}
+
+    wr.neptune.bulk_load(
+        client=mock.MagicMock(),
+        df=df,
+        path="s3://bucket/stage/",
+        iam_role="arn:aws:iam::123456789012:role/example",
+        boto3_session=session,
+        s3_additional_kwargs=s3_kwargs,
+    )
+
+    # The staged write must run under the caller's session and encryption kwargs,
+    # matching the list_objects/delete_objects calls in the same function.
+    assert to_csv.call_args.kwargs["boto3_session"] is session
+    assert to_csv.call_args.kwargs["s3_additional_kwargs"] == s3_kwargs
+
+
+# Both a timezone ahead of and behind UTC, so the assertions are meaningful either way.
+@pytest.mark.parametrize("local_timezone", ["Asia/Tokyo", "America/New_York"], indirect=True)
+def test_cloudwatch_start_query_default_end_time_is_utc_now(local_timezone) -> None:
+    # The default `end_time` must be the current UTC instant regardless of the machine's
+    # local timezone. A naive UTC datetime is interpreted as local time by
+    # `datetime.timestamp()`, which shifts the query window by the local UTC offset.
+    logs_client = mock.MagicMock()
+    logs_client.start_query.return_value = {"queryId": "query-id"}
+
+    with mock.patch("awswrangler._utils.client", return_value=logs_client):
+        wr.cloudwatch.start_query(query="fields @timestamp", log_group_names=["log-group"])
+
+    args = logs_client.start_query.call_args.kwargs
+    now_milliseconds = int(1000 * datetime.now(tz=timezone.utc).timestamp())
+    assert abs(args["endTime"] - now_milliseconds) < 60_000
+    # The default `start_time` remains the Unix epoch.
+    assert args["startTime"] == 0
+
+
+@pytest.mark.parametrize("local_timezone", ["Asia/Tokyo", "America/New_York"], indirect=True)
+def test_cloudwatch_start_query_recent_start_time_with_default_end_time(local_timezone) -> None:
+    # A `start_time` in the recent past is valid against the default `end_time`; a local
+    # offset ahead of UTC used to push the default `end_time` before it and raise.
+    logs_client = mock.MagicMock()
+    logs_client.start_query.return_value = {"queryId": "query-id"}
+    start_time = datetime.now(tz=timezone.utc) - timedelta(minutes=5)
+
+    with mock.patch("awswrangler._utils.client", return_value=logs_client):
+        query_id = wr.cloudwatch.start_query(
+            query="fields @timestamp",
+            log_group_names=["log-group"],
+            start_time=start_time,
+        )
+
+    assert query_id == "query-id"
+    args = logs_client.start_query.call_args.kwargs
+    assert args["startTime"] == int(1000 * start_time.timestamp())
+    assert args["endTime"] > args["startTime"]
+
+
+@pytest.mark.parametrize("local_timezone", ["Asia/Tokyo"], indirect=True)
+def test_cloudwatch_start_query_explicit_times_are_preserved(local_timezone) -> None:
+    # Explicitly passed boundaries keep being converted straight to epoch milliseconds.
+    logs_client = mock.MagicMock()
+    logs_client.start_query.return_value = {"queryId": "query-id"}
+    start_time = datetime(2024, 1, 1, 0, 0, 0, tzinfo=timezone.utc)
+    end_time = datetime(2024, 1, 2, 0, 0, 0, tzinfo=timezone.utc)
+
+    with mock.patch("awswrangler._utils.client", return_value=logs_client):
+        wr.cloudwatch.start_query(
+            query="fields @timestamp",
+            log_group_names=["log-group"],
+            start_time=start_time,
+            end_time=end_time,
+        )
+
+    args = logs_client.start_query.call_args.kwargs
+    assert args["startTime"] == 1_704_067_200_000
+    assert args["endTime"] == 1_704_153_600_000
+
+
+def test_emr_default_logging_path_warns() -> None:
+    """Falling back to the predictable default logging bucket must emit a warning."""
+    with moto.mock_aws():
+        session = boto3.Session(region_name="us-east-1")
+        with pytest.warns(UserWarning, match="predictable name"):
+            wr.emr._get_default_logging_path(account_id="123456789012", region="us-east-1", boto3_session=session)
+
+
+def test_emr_verify_bucket_ownership_own_bucket() -> None:
+    """_verify_bucket_ownership must succeed when the bucket belongs to the caller."""
+    from awswrangler.emr import _verify_bucket_ownership
+
+    with moto.mock_aws():
+        session = boto3.Session(region_name="us-east-1")
+        account_id = session.client("sts").get_caller_identity()["Account"]
+        session.client("s3").create_bucket(Bucket="my-owned-bucket")
+
+        _verify_bucket_ownership("my-owned-bucket", account_id, boto3_session=session)
+
+
+def _s3_client_raising(code: str, status: int) -> mock.MagicMock:
+    client = mock.MagicMock()
+    client.head_bucket.side_effect = ClientError(
+        {"Error": {"Code": code, "Message": ""}, "ResponseMetadata": {"HTTPStatusCode": status}}, "HeadBucket"
+    )
+    return client
+
+
+@pytest.mark.parametrize("code,status", [("403", 403), ("AccessDenied", 403)])
+def test_emr_verify_bucket_ownership_rejects_foreign_bucket(code: str, status: int) -> None:
+    """A 403 from HeadBucket with ExpectedBucketOwner means the bucket is not ours (or not verifiable)."""
+    from awswrangler.emr import _verify_bucket_ownership
+
+    client = _s3_client_raising(code, status)
+    with mock.patch("awswrangler._utils.client", return_value=client):
+        with pytest.raises(wr.exceptions.InvalidArgumentValue, match="owned by account 123456789012"):
+            _verify_bucket_ownership("aws-logs-123456789012-us-east-1", "123456789012")
+
+    assert client.head_bucket.call_args.kwargs == {
+        "Bucket": "aws-logs-123456789012-us-east-1",
+        "ExpectedBucketOwner": "123456789012",
+    }
+
+
+@pytest.mark.parametrize("code,status", [("404", 404), ("NoSuchBucket", 404)])
+def test_emr_verify_bucket_ownership_rejects_missing_bucket(code: str, status: int) -> None:
+    """A missing default bucket is exactly the squattable state, so it must be rejected too."""
+    from awswrangler.emr import _verify_bucket_ownership
+
+    client = _s3_client_raising(code, status)
+    with mock.patch("awswrangler._utils.client", return_value=client):
+        with pytest.raises(wr.exceptions.InvalidArgumentValue, match="does not exist"):
+            _verify_bucket_ownership("aws-logs-123456789012-us-east-1", "123456789012")
+
+
+def test_emr_verify_bucket_ownership_reraises_other_errors() -> None:
+    """Unrelated S3 errors (throttling, etc.) must not be masked as ownership failures."""
+    from awswrangler.emr import _verify_bucket_ownership
+
+    client = _s3_client_raising("SlowDown", 503)
+    with mock.patch("awswrangler._utils.client", return_value=client):
+        with pytest.raises(ClientError):
+            _verify_bucket_ownership("aws-logs-123456789012-us-east-1", "123456789012")
+
+
+def test_emr_create_cluster_verifies_default_logging_bucket() -> None:
+    """create_cluster must verify ownership of the default log bucket, and skip it for explicit paths."""
+    with moto.mock_aws():
+        session = boto3.Session(region_name="us-east-1")
+        account_id = session.client("sts").get_caller_identity()["Account"]
+
+        with mock.patch("awswrangler.emr._verify_bucket_ownership") as verify:
+            with pytest.warns(UserWarning, match="aws-logs-"):
+                wr.emr.create_cluster(subnet_id="subnet-0123456789abcdef0", boto3_session=session)
+            verify.assert_called_once_with(f"aws-logs-{account_id}-us-east-1", account_id, boto3_session=session)
+
+        with mock.patch("awswrangler.emr._verify_bucket_ownership") as verify:
+            wr.emr.create_cluster(
+                subnet_id="subnet-0123456789abcdef0",
+                logging_s3_path="s3://my-own-bucket/emr-logs/",
+                boto3_session=session,
+            )
+            verify.assert_not_called()
+
+
+def test_merge_datasets_overwrite_partitions_root_files(moto_s3_client) -> None:
+    bucket = "bucket"
+    # Target has existing files at the dataset root, in a partition that the source will
+    # replace, and in a partition that the source does not contain.
+    moto_s3_client.put_object(Bucket=bucket, Key="target/file_old.csv", Body=b"old")
+    moto_s3_client.put_object(Bucket=bucket, Key="target/_SUCCESS", Body=b"old-success")
+    moto_s3_client.put_object(Bucket=bucket, Key="target/part=1/file_old_p.csv", Body=b"old_p")
+    moto_s3_client.put_object(Bucket=bucket, Key="target/part=2/keep.csv", Body=b"keep")
+
+    # Source has a root-level marker plus files at the dataset root and in part=1.
+    moto_s3_client.put_object(Bucket=bucket, Key="source/_SUCCESS", Body=b"new-success")
+    moto_s3_client.put_object(Bucket=bucket, Key="source/file_new.csv", Body=b"new")
+    moto_s3_client.put_object(Bucket=bucket, Key="source/part=1/file_new_p.csv", Body=b"new_p")
+
+    copied = wr.s3.merge_datasets(
+        source_path=f"s3://{bucket}/source/",
+        target_path=f"s3://{bucket}/target/",
+        mode="overwrite_partitions",
+    )
+
+    assert set(copied) == {
+        f"s3://{bucket}/target/_SUCCESS",
+        f"s3://{bucket}/target/file_new.csv",
+        f"s3://{bucket}/target/part=1/file_new_p.csv",
+    }
+
+    target_objects = wr.s3.list_objects(f"s3://{bucket}/target/")
+    assert set(target_objects) == {
+        f"s3://{bucket}/target/_SUCCESS",
+        f"s3://{bucket}/target/file_new.csv",
+        f"s3://{bucket}/target/part=1/file_new_p.csv",
+        f"s3://{bucket}/target/part=2/keep.csv",
+    }
+
+
+@pytest.mark.parametrize(
+    "target_keys,source_keys,survivors",
+    [
+        # source without root files must leave the target root alone
+        (
+            ["root.csv", "part=1/old.csv", "part=2/keep.csv"],
+            ["part=1/new.csv"],
+            ["root.csv", "part=1/new.csv", "part=2/keep.csv"],
+        ),
+        # the folder-marker object (key == prefix) is not a root file
+        (["", "old.csv", "part=1/keep.csv"], ["new.csv"], ["", "new.csv", "part=1/keep.csv"]),
+    ],
+)
+def test_merge_datasets_overwrite_partitions_root_scope(moto_s3_client, target_keys, source_keys, survivors) -> None:
+    prefix = f"merge_{_get_unique_suffix()}"
+    for key in target_keys:
+        moto_s3_client.put_object(Bucket="bucket", Key=f"{prefix}/target/{key}", Body=b"old")
+    for key in source_keys:
+        moto_s3_client.put_object(Bucket="bucket", Key=f"{prefix}/source/{key}", Body=b"new")
+
+    wr.s3.merge_datasets(
+        source_path=f"s3://bucket/{prefix}/source/",
+        target_path=f"s3://bucket/{prefix}/target/",
+        mode="overwrite_partitions",
+    )
+
+    keys = moto_s3_client.list_objects_v2(Bucket="bucket", Prefix=f"{prefix}/target/")["Contents"]
+    assert sorted(o["Key"] for o in keys) == sorted(f"{prefix}/target/{key}" for key in survivors)

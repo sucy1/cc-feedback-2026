@@ -1,0 +1,5 @@
+来源仓库：https://github.com/aws/aws-sdk-pandas
+冻结 commit：88373dab8dee5ae6dabdacf92cdf377ad0c65468
+许可证：Apache-2.0
+导入日期：2026-11-11
+说明：本目录为评测底座，已剥离上游 git 历史，仅保留代码快照。

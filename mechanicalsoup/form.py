@@ -329,6 +329,9 @@ class Form:
     ) -> bs4.element.Tag | Literal[False] | None:
         """Selects the input (or button) element to use for form submission.
 
+        Submit-type inputs (``type="submit"`` and ``type="image"``) and
+        buttons are accepted.
+
         :param submit: The :class:`bs4.element.Tag` (or just its
             *name*-attribute) that identifies the submit element to use. If
             ``None``, will choose the first valid submit element in the form,
@@ -354,10 +357,12 @@ class Form:
             self._submit_chosen = False
             return self._submit_chosen
 
-        # All buttons NOT of type (button,reset) are valid submits
-        # Case-insensitive search for type=submit
+        # All buttons NOT of type (button,reset) are valid submits, as are
+        # submit-like inputs (type=submit and type=image).
+        # Case-insensitive search for type=submit/image
         inps = [
-            inp for inp in self.form.select('input[type="submit" i], button')
+            inp for inp in self.form.select(
+                'input[type="submit" i], input[type="image" i], button')
             if (
                 not isinstance(inp_type := inp.get("type"), str)
                 or inp_type.lower() not in ('button', 'reset')

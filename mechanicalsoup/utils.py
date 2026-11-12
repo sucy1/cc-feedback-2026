@@ -16,9 +16,16 @@ class LinkNotFoundError(Exception):
     pass
 
 
-def is_multipart_file_upload(form, tag):
+def is_multipart_file_upload(form, tag, enctype=None):
+    """Return whether ``tag`` is a file input that will be sent as a file.
+
+    ``enctype`` can override the form's *enctype*-attribute, which is needed
+    when the selected submit element carries a *formenctype*-attribute.
+    """
+    if enctype is None:
+        enctype = form.get("enctype", "")
     return (
-        form.get("enctype", "") == "multipart/form-data" and
+        str(enctype).strip().lower() == "multipart/form-data" and
         tag.get("type", "").lower() == "file"
     )
 

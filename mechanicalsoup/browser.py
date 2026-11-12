@@ -217,20 +217,25 @@ class Browser:
     @classmethod
     def get_request_kwargs(cls, form, url=None, submit=None, **kwargs):
         """Extract input data from the form."""
-        method = str(form.get("method", "get"))
+        method = str(form.get("method", "get")).lower()
         action = form.get("action")
+        enctype = str(form.get("enctype", "") or "")
 
-        # If the form has a submit button, use its form action
+        # A selected submit element can override the form's action, method
+        # and encoding. This applies to <button> as well as to submit-like
+        # <input> elements (type="submit" and type="image").
         # https://developer.mozilla.org/en-US/docs/Web/HTML/Reference/Elements/button#formaction.
-        if isinstance(submit, bs4.element.Tag) and (submit.name == "button"):
+        if isinstance(submit, bs4.element.Tag):
             action = submit.get("formaction", action)
+            method = str(submit.get("formmethod", method)).lower()
+            enctype = str(submit.get("formenctype", enctype) or "")
 
         url = urllib.parse.urljoin(url, action)
         if url is None:  # This happens when both `action` and `url` are None.
             raise ValueError('no URL to submit to')
 
         # read https://www.w3.org/TR/html52/sec-forms.html
-        if method.lower() == "get":
+        if method == "get":
             data = kwargs.pop("params", dict())
         else:
             data = kwargs.pop("data", dict())
@@ -240,7 +245,7 @@ class Browser:
         # Requests also retains order when encoding form data in 2-tuple lists.
         data = [(k, v) for k, v in data.items()]
 
-        multipart = form.get("enctype", "") == "multipart/form-data"
+        multipart = enctype.strip().lower() == "multipart/form-data"
 
         # Process form tags in the order that they appear on the page,
         # skipping those tags that do not have a name-attribute.
@@ -258,7 +263,7 @@ class Browser:
 
             if tag.name == "input":
                 tag_type = tag.get("type", "").lower()
-                if tag_type == "submit":
+                if tag_type in ("submit", "image"):
                     # Skip submit-type inputs that were not selected
                     if submit_added or (tag != submit):
                         continue
@@ -269,13 +274,19 @@ class Browser:
                     if "checked" not in tag.attrs:
                         continue
                     value = tag.get("value", "on")
+                elif tag_type == "image":
+                    # Image buttons submit click coordinates instead of their
+                    # value, as <name>.x and <name>.y.
+                    data.append((name + ".x", "0"))
+                    data.append((name + ".y", "0"))
+                    continue
                 else:
                     # browsers use empty string for inputs with missing values
                     value = tag.get("value", "")
 
                 # If the enctype is not multipart, the filename is put in
                 # the form as a text input and the file is not sent.
-                if is_multipart_file_upload(form, tag):
+                if is_multipart_file_upload(form, tag, enctype):
                     if isinstance(value, io.IOBase):
                         content = value
                         filename = os.path.basename(getattr(value, "name", ""))
@@ -319,7 +330,7 @@ class Browser:
                     first_value = options[0].get("value", options[0].text)
                     data.append((name, first_value))
 
-        if method.lower() == "get":
+        if method == "get":
             kwargs["params"] = data
         else:
             kwargs["data"] = data

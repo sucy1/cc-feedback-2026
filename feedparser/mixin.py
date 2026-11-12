@@ -33,7 +33,7 @@ import re
 import xml.sax.saxutils
 
 from .html import _cp1252
-from .namespaces import _base, cc, dc, georss, itunes, mediarss, psc
+from .namespaces import _base, cc, dc, georss, itunes, mediarss, podcast, psc
 from .sanitizer import HTMLSanitizer, sanitize_html
 from .urls import _urljoin, make_safe_absolute_uri, resolve_relative_uris
 from .util import FeedParserDict
@@ -53,6 +53,7 @@ class XMLParserMixin(
     itunes.Namespace,
     mediarss.Namespace,
     psc.Namespace,
+    podcast.Namespace,
 ):
     namespaces = {
         "": "",
@@ -124,6 +125,10 @@ class XMLParserMixin(
         "http://www.w3.org/1999/xlink": "xlink",
         "http://www.w3.org/XML/1998/namespace": "xml",
         "http://podlove.org/simple-chapters": "psc",
+        "https://podcastindex.org/namespace/1.0": "podcast",
+        "http://podcastindex.org/namespace/1.0": "podcast",
+        "https://podcastindex.org/namespace/1.0/": "podcast",
+        "http://podcastindex.org/namespace/1.0/": "podcast",
     }
     _matchnamespaces: dict[str, str] = {}
 

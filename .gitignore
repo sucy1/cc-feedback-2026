@@ -56,3 +56,7 @@ docs/_build/
 
 # virtualenv
 .virtual-*
+
+# 本地虚拟环境与凭据（不入库）
+.venv/
+.env
